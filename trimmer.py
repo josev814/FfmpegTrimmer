@@ -86,16 +86,17 @@ class Install_Requirements():
         build_file = 'ffmpeg-release-full.7z'
         self.download_ffmpeg(build_file)
         if os.path.isfile(build_file):
-            extract_ffmpeg(build_file)
+            self.extract_ffmpeg(build_file)
         else:
             raise FileNotFoundError(f'Failed to find {build_file}')
 
         exes = ['ffmpeg', 'ffplay', 'ffprobe']
+        if not os.path.isdir(FFMPEG_DIR):
+            os.mkdir(FFMPEG_DIR)
         for ffmpeg_dir in glob.glob('ffmpeg-*-full_build'):
             for entry in os.scandir(os.path.join(ffmpeg_dir, 'bin')):
                 if entry.name.endswith('exe') and entry.name.replace('.exe', '') in exes and not os.path.isfile(f'./{FFMPEG_DIR}/{entry.name}'):
                     os.rename(entry.path, f'./{FFMPEG_DIR}/{entry.name}')
-                    continue
         for entry in os.scandir('./'):
             if entry.is_dir() and entry.name.endswith('full_build'):
                 shutil.rmtree(entry.path)
