@@ -27,6 +27,7 @@ class Install_Requirements():
     def __init__(self):
         if not self.is_vlc_installed():
             self.install_vlc()
+        self.install_ffmpeg()
 
     def is_vlc_installed(self):
         if os.path.isfile(os.path.join(VLC_PATH, 'vlc.exe')):
