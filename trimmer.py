@@ -140,7 +140,7 @@ class VideoCutterThread(QThread):
 
         command = [
             f"{FFMPEG_DIR}/ffmpeg.exe",
-            'y', # override prompt to overwrite
+            '-y', # override prompt to overwrite
             "-i", self.file_path,
             "-ss", self.start_time,
             "-to", self.end_time,
@@ -152,6 +152,7 @@ class VideoCutterThread(QThread):
             command.extend(["-af", f"loudnorm=I={self.audio_level}"])
 
         command.append(output_file)
+        print(' '.join(command))
         self.process = subprocess.Popen(command, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, text=True)
 
