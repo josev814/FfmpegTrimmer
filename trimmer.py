@@ -28,20 +28,47 @@ VLC_PATH = r'C:\Program Files\VideoLAN\VLC'
 # https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-win64-gpl-7.1.zip
 SUPPORTED_VIDEOS = ('.mp4', '.mkv', '.avi', '.mov', '.flv')
 
-class Install_Requirements():
+
+class InstallRequirementsThread(QThread):
+    progress = pyqtSignal(str)  # Signal to send progress updates
+    install_complete = pyqtSignal()  # Signal when installation is complete
+    error_occurred = pyqtSignal(str)  # Signal when an error occurs
 
     def __init__(self):
-        if not self.is_vlc_installed():
-            self.install_vlc()
-        self.install_ffmpeg()
+        super().__init__()
+
+    def run(self):
+        try:
+            # Check and install VLC if needed
+            if not self.is_vlc_installed():
+                self.progress.emit("Installing VLC...")
+                self.install_vlc()
+
+            # Check and install FFmpeg if needed
+            if not self.is_ffmpeg_installed():
+                self.progress.emit("Installing FFmpeg...")
+                self.install_ffmpeg()
+
+            # Emit completion signal
+            self.install_complete.emit()
+        except Exception as e:
+            # If something goes wrong, emit the error message
+            self.error_occurred.emit(str(e))
 
     def is_vlc_installed(self):
         if os.path.isfile(os.path.join(VLC_PATH, 'vlc.exe')):
             return True
         return False
 
+    def install_vlc(self):
+        installer_path = 'vlc_installer.exe'
+        if not os.path.isfile(installer_path):
+            self.download_vlc(installer_path)
+        subprocess.run([installer_path, '/S'], shell=True)
+        os.remove(installer_path)
+
     def download_vlc(self, installer_path):
-        print('VLC is not installed. Downloading...')
+        self.progress.emit('Downloading VLC...')
         self.download_file(VLC_WINDOWS_URL, installer_path)
 
     def download_file(self, url, dest):
@@ -50,69 +77,40 @@ class Install_Requirements():
             for chunk in response.iter_content(chunk_size=8192):
                 file.write(chunk)
 
-    def install_vlc(self):
-        installer_path = 'vlc_installer.exe'
-        if not os.path.isfile(installer_path):
-            self.download_vlc(installer_path)
-        print('Installing VLC')
-        subprocess.run([installer_path, '/S'], shell=True)
-        os.remove(installer_path)
-        print('VLC install Complete')
-
     def is_ffmpeg_installed(self):
         if os.path.isdir(FFMPEG_DIR) and os.path.isfile(os.path.join(FFMPEG_DIR, 'ffmpeg.exe')):
             return True
         return False
 
-    def extract_ffmpeg(self, build_file):
-        # Extract the tar file
-        py7 = py7zip.Py7zip()
-        bin_url = py7.get_binary_url()
-        # Download and set up the binary if it isn't already set up
-        if not os.path.exists(py7.binary_path):
-            py7.download_binary()
-            py7.setup()
-        dst=f'./'
-        cmd = [py7.binary_path, 'x', build_file, f'-bb3', f'-o{dst}']
-
-        # Run the subprocess and capture output
-        try:
-            result = subprocess.run(cmd, check=False, text=False, capture_output=False)
-            print(f"Decompression completed successfully! Output:\n{result.stdout}")
-        except subprocess.CalledProcessError as e:
-            print(f"Error during decompression: {e.stderr}")
-        os.remove(build_file)
-
-    def download_ffmpeg(self, build_file):
-        """Downloads FFmpeg if not found in the current directory."""
-        if os.path.exists(FFMPEG_DIR) and os.path.isfile(os.path.join(FFMPEG_DIR, 'ffmpeg.exe')):
-            return
-        if os.path.isfile(build_file):
-            # release already downloaded
-            return
-        print("Downloading FFmpeg...")
-        self.download_file(FFMPEG_URL, build_file)
-
     def install_ffmpeg(self):
-        if self.is_ffmpeg_installed():
-            return
         build_file = 'ffmpeg-release-full.7z'
-        self.download_ffmpeg(build_file)
-        if os.path.isfile(build_file):
-            self.extract_ffmpeg(build_file)
-        else:
-            raise FileNotFoundError(f'Failed to find {build_file}')
+        if not os.path.isfile(build_file):
+            self.download_file(FFMPEG_URL, build_file)
+
+        self.progress.emit("Extracting FFmpeg...")
+        self.extract_ffmpeg(build_file)
 
         exes = ['ffmpeg', 'ffplay', 'ffprobe']
         if not os.path.isdir(FFMPEG_DIR):
             os.mkdir(FFMPEG_DIR)
         for ffmpeg_dir in glob.glob('ffmpeg-*-full_build'):
             for entry in os.scandir(os.path.join(ffmpeg_dir, 'bin')):
-                if entry.name.endswith('exe') and entry.name.replace('.exe', '') in exes and not os.path.isfile(f'./{FFMPEG_DIR}/{entry.name}'):
+                if entry.name.endswith('exe') and entry.name.replace('.exe', '') in exes and not os.path.isfile(
+                        f'./{FFMPEG_DIR}/{entry.name}'):
                     os.rename(entry.path, f'./{FFMPEG_DIR}/{entry.name}')
         for entry in os.scandir('./'):
             if entry.is_dir() and entry.name.endswith('full_build'):
                 shutil.rmtree(entry.path)
+
+    def extract_ffmpeg(self, build_file):
+        py7 = py7zip.Py7zip()
+        if not os.path.exists(py7.binary_path):
+            py7.download_binary()
+            py7.setup()
+        dst = './'
+        cmd = [py7.binary_path, 'x', build_file, f'-bb3', f'-o{dst}']
+        subprocess.run(cmd, check=False, text=False, capture_output=False)
+        os.remove(build_file)
 
 
 class AudioLevelAnalysisThread(QThread):
@@ -350,6 +348,40 @@ class VideoCutterApp(QWidget):
         layout.addWidget(self.progress_bar, 11, 0, 1, 3)
 
         self.setLayout(layout)
+        self.ensure_requirements()
+
+    def ensure_requirements(self):
+        self.msg = None
+        # Start the installation of requirements when the app starts
+        self.install_thread = InstallRequirementsThread()
+        self.install_thread.progress.connect(self.show_install_progress)
+        self.install_thread.install_complete.connect(self.on_install_complete)
+        self.install_thread.error_occurred.connect(self.on_install_error)
+
+        # Start the installation thread
+        self.install_thread.start()
+
+    def show_install_progress(self, message):
+        """Displays a progress message during installation."""
+        self.show_message(message)
+
+    def on_install_complete(self):
+        """Handles actions when installation completes."""
+        self.show_message("Installation complete! FFmpeg and VLC are ready to use.")
+        # Proceed with the rest of the app initialization
+        # self.initialize_ui()
+
+    def on_install_error(self, error_message):
+        """Handles installation errors."""
+        self.show_message(f"Error: {error_message}", QMessageBox.Critical)
+
+    def show_message(self, message):
+        """Show a message box with the specified message and icon."""
+        if not self.msg:
+            self.msg = QMessageBox(self)
+        self.msg.setText(message)
+        self.msg.setWindowTitle("Installation Progress")
+        self.msg.exec()
 
     def select_file(self):
         self.progress_bar.setValue(0)
@@ -571,7 +603,6 @@ class VideoCutterApp(QWidget):
 
 
 if __name__ == "__main__":
-    Install_Requirements()
     app = QApplication(sys.argv)
     window = VideoCutterApp()
     window.show()
