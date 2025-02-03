@@ -3,17 +3,22 @@ import json
 import sys
 import subprocess
 import os
+import re
 import glob
+import time
+
+# third party libs
 import ffmpeg
 import numpy as np
 from PyQt6.QtWidgets import (
-    QApplication, QWidget, QVBoxLayout, QPushButton, QFileDialog,
+    QApplication, QWidget, QGridLayout, QPushButton, QFileDialog,
     QLabel, QLineEdit, QMessageBox, QProgressBar, QComboBox
 )
 from PyQt6.QtCore import QThread, pyqtSignal, Qt
 import requests
 from py7zip import py7zip
 
+APP_NAME = "FFmpeg Video Trim"
 # FFmpeg download URL (Windows version)
 FFMPEG_URL = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-full.7z"
 FFMPEG_DIR = "ffmpeg"
@@ -21,6 +26,7 @@ VLC_WINDOWS_URL = 'https://download.videolan.org/pub/videolan/vlc/last/win64/vlc
 VLC_PATH = r'C:\Program Files\VideoLAN\VLC'
 # possibly switch to github builds
 # https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n7.1-latest-win64-gpl-7.1.zip
+SUPPORTED_VIDEOS = ('.mp4', '.mkv', '.avi', '.mov', '.flv')
 
 class Install_Requirements():
 
@@ -53,6 +59,11 @@ class Install_Requirements():
         os.remove(installer_path)
         print('VLC install Complete')
 
+    def is_ffmpeg_installed(self):
+        if os.path.isdir(FFMPEG_DIR) and os.path.isfile(os.path.join(FFMPEG_DIR, 'ffmpeg.exe')):
+            return True
+        return False
+
     def extract_ffmpeg(self, build_file):
         # Extract the tar file
         py7 = py7zip.Py7zip()
@@ -83,6 +94,8 @@ class Install_Requirements():
         self.download_file(FFMPEG_URL, build_file)
 
     def install_ffmpeg(self):
+        if self.is_ffmpeg_installed():
+            return
         build_file = 'ffmpeg-release-full.7z'
         self.download_ffmpeg(build_file)
         if os.path.isfile(build_file):
@@ -106,6 +119,7 @@ class VideoCutterThread(QThread):
     """Runs FFmpeg in a separate thread to prevent UI freezing."""
     progress = pyqtSignal(int)  # Signal to update progress bar
     finished = pyqtSignal(str)  # Signal when extraction is done
+    cancel_requested = pyqtSignal()
 
     def __init__(self, file_path, start_time, end_time, output_path, audio_level):
         super().__init__()
@@ -114,6 +128,8 @@ class VideoCutterThread(QThread):
         self.end_time = end_time
         self.output_path = output_path
         self.audio_level = audio_level
+        self.process = None  # Initialize process as None
+        self._is_cancelled = False
 
     def run(self):
         output_file = os.path.join(
@@ -124,6 +140,7 @@ class VideoCutterThread(QThread):
 
         command = [
             f"{FFMPEG_DIR}/ffmpeg.exe",
+            'y', # override prompt to overwrite
             "-i", self.file_path,
             "-ss", self.start_time,
             "-to", self.end_time,
@@ -131,22 +148,28 @@ class VideoCutterThread(QThread):
             "-c:a", "aac",
         ]
 
-        if self.audio_level in ["-1", "-3", "-5"]:
+        if not self.audio_level == 'Skip':
             command.extend(["-af", f"loudnorm=I={self.audio_level}"])
 
         command.append(output_file)
-
-        process = subprocess.Popen(command, stdout=subprocess.PIPE,
+        self.process = subprocess.Popen(command, stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, text=True)
 
-        for line in process.stdout:
+        for line in self.process.stdout:
+            if self._is_cancelled:
+                # If cancellation is requested, terminate FFmpeg
+                self.process.terminate()
+                self.process.wait()
+                break
+
             if "time=" in line:
                 time_str = line.split("time=")[1].split(" ")[0]
                 progress = self.calculate_progress(time_str)
                 self.progress.emit(progress)
 
-        process.wait()
-        self.finished.emit(output_file)
+        self.process.wait()
+        if not self._is_cancelled:
+            self.finished.emit(output_file)
 
     def calculate_progress(self, time_str):
         """Estimates progress based on the extracted time."""
@@ -168,98 +191,134 @@ class VideoCutterThread(QThread):
         except ValueError:
             return 0  # Default to 0 if parsing fails
 
+    def cancel(self):
+        """Cancel the FFmpeg process."""
+        self._is_cancelled = True
+        if self.process:
+            self.process.terminate()  # Terminate the FFmpeg process
+            self.process.wait()  # Wait for the process to clean up
+            self.finished.emit('Cancelled')
+
 
 class VideoCutterApp(QWidget):
     """Main UI for the FFmpeg Video Cutter with audio normalization support."""
     def __init__(self):
         super().__init__()
 
-        self.setWindowTitle("FFmpeg Video Cutter")
-        self.setGeometry(300, 200, 600, 500)
+        self.setWindowTitle(APP_NAME)
+        self.setGeometry(300, 200, 600, 300)
         self.setAcceptDrops(True)  # Enable drag-and-drop
 
-        layout = QVBoxLayout()
+        layout = QGridLayout()
+        layout.setVerticalSpacing(5)
 
         # File selection
         self.label_file = QLabel("Drag and drop a video file or browse:")
-        layout.addWidget(self.label_file)
+        layout.addWidget(self.label_file, 0, 0)
 
         self.input_file = QLineEdit()
         self.input_file.setReadOnly(True)
-        layout.addWidget(self.input_file)
+        layout.addWidget(self.input_file, 1, 0, 1,2)
 
         self.btn_browse = QPushButton("Browse Video")
         self.btn_browse.clicked.connect(self.select_file)
-        layout.addWidget(self.btn_browse)
+        layout.addWidget(self.btn_browse, 1, 2)
 
         # Video duration display
-        self.label_duration = QLabel("Duration: N/A")
-        layout.addWidget(self.label_duration)
+        self.label_duration = QLabel("Duration:")
+        layout.addWidget(self.label_duration, 3, 0)
+        self.duration_value = QLabel('--:--:--')
+        layout.addWidget(self.duration_value, 3, 1)
 
         # Audio dB level display
-        self.label_audio_level = QLabel("Current Audio Level: Analyzing...")
-        layout.addWidget(self.label_audio_level)
+        self.label_audio_level = QLabel("Current Audio Level:")
+        layout.addWidget(self.label_audio_level, 4, 0)
+        self.audio_level_value = QLabel('--')
+        layout.addWidget(self.audio_level_value, 4, 1)
 
         # Start time input
         self.label_start = QLabel("Start Time (hh:mm:ss):")
-        layout.addWidget(self.label_start)
+        layout.addWidget(self.label_start, 5, 0)
 
         self.input_start = QLineEdit()
-        layout.addWidget(self.input_start)
+        layout.addWidget(self.input_start, 5, 1)
 
         # End time input
         self.label_end = QLabel("End Time (hh:mm:ss):")
-        layout.addWidget(self.label_end)
+        layout.addWidget(self.label_end, 6, 0)
 
         self.input_end = QLineEdit()
-        layout.addWidget(self.input_end)
+        layout.addWidget(self.input_end, 6, 1)
 
         # Audio Normalization options
         self.label_audio = QLabel("Audio Normalization:")
-        layout.addWidget(self.label_audio)
+        layout.addWidget(self.label_audio, 7, 0)
 
         self.audio_options = QComboBox()
-        self.audio_options.addItems(["Skip", "-1 dB", "-3 dB", "-5 dB"])
-        layout.addWidget(self.audio_options)
+        self.audio_options.addItems(["Skip", "-5 dB", "-10 dB", "-15 dB"])
+        layout.addWidget(self.audio_options, 7, 1)
 
         # Output folder selection
         self.label_output = QLabel("Output Folder:")
-        layout.addWidget(self.label_output)
+        layout.addWidget(self.label_output, 8, 0)
 
         self.input_output = QLineEdit()
         self.input_output.setReadOnly(True)
-        layout.addWidget(self.input_output)
+        layout.addWidget(self.input_output, 8, 1)
 
         self.btn_output = QPushButton("Select Output Folder")
         self.btn_output.clicked.connect(self.select_output_folder)
-        layout.addWidget(self.btn_output)
+        layout.addWidget(self.btn_output, 8, 2)
 
         # Video preview button
         self.btn_preview = QPushButton("Preview Selected Clip")
         self.btn_preview.clicked.connect(self.preview_clip)
-        layout.addWidget(self.btn_preview)
-
-        # Progress bar
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setValue(0)
-        layout.addWidget(self.progress_bar)
+        layout.addWidget(self.btn_preview, 10, 0)
 
         # Extract button
         self.btn_extract = QPushButton("Extract Video")
         self.btn_extract.clicked.connect(self.extract_video)
-        layout.addWidget(self.btn_extract)
+        layout.addWidget(self.btn_extract, 10, 1)
+
+        self.btn_cancel = QPushButton("Cancel Extract")
+        self.btn_cancel.clicked.connect(self.cancel_extract)
+        self.btn_cancel.setEnabled(False)
+        layout.addWidget(self.btn_cancel, 10, 2)
+
+        # Progress bar
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setValue(0)
+        self.progress_bar.setVisible(False)
+        layout.addWidget(self.progress_bar, 11, 0, 1, 3)
 
         self.setLayout(layout)
 
     def select_file(self):
         """Opens a file dialog for selecting a video file."""
         file_path, _ = QFileDialog.getOpenFileName(
-            self, "Select Video File", "", "Video Files (*.mp4 *.mkv *.avi *.mov *.flv)"
+            self, "Select Video File", "", f"Video Files (*{' *'.join(SUPPORTED_VIDEOS)})"
         )
         if file_path:
             self.input_file.setText(file_path)
             self.update_video_duration(file_path)
             self.analyze_audio_level(file_path)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        try:
+            file_url = event.mimeData().urls()[0].toLocalFile()
+            if file_url and file_url.lower().endswith(SUPPORTED_VIDEOS):
+                self.input_file.setText(file_url)
+                self.update_video_duration(file_url)
+                self.analyze_audio_level(file_url)
+                print(f'File Dropped: {file_url}')
+            else:
+                QMessageBox.critical(self, 'Invalid File', f'Only ({SUPPORTED_VIDEOS}) are accepted')
+        except Exception as e:
+            print(e)
 
     def update_video_duration(self, file_path):
         """Retrieves and displays the video duration."""
@@ -274,7 +333,7 @@ class VideoCutterApp(QWidget):
 
             # Convert duration to hh:mm:ss format
             hh, mm, ss = int(duration // 3600), int((duration % 3600) // 60), int(duration % 60)
-            self.label_duration.setText(f"Duration: {hh:02}:{mm:02}:{ss:02}")
+            self.duration_value.setText(f"{hh:02}:{mm:02}:{ss:02}")
             self.input_end.setText(f"{hh:02}:{mm:02}:{ss:02}")
             self.input_start.setText("00:00:00")
 
@@ -293,11 +352,11 @@ class VideoCutterApp(QWidget):
             for line in result.stderr.split("\n"):
                 if "mean_volume" in line:
                     dB_level = line.split(":")[-1].strip()
-                    self.label_audio_level.setText(f"Current Audio Level: {dB_level} dB")
+                    self.audio_level_value.setText(f"{dB_level} dB")
                     return
-            self.label_audio_level.setText("Current Audio Level: Not detected")
+            self.audio_level_value.setText("Current Audio Level: Not detected")
         except Exception:
-            self.label_audio_level.setText("Current Audio Level: Error")
+            self.audio_level_value.setText("Current Audio Level: Error")
 
     def preview_clip(self):
         """Previews the selected video clip."""
@@ -349,7 +408,6 @@ class VideoCutterApp(QWidget):
         start_time = self.input_start.text()
         end_time = self.input_end.text()
         output_path = self.input_output.text()
-
         if not file_path or not start_time or not end_time or not output_path:
             QMessageBox.critical(self, "Error", "Please complete all fields.")
             valid = False
@@ -377,16 +435,41 @@ class VideoCutterApp(QWidget):
 
         if not self.validate_inputs():
             return
-
+        self.progress_bar.setVisible(True)
         self.progress_bar.setValue(0)
+        self.btn_cancel.setEnabled(True)
+        self.btn_extract.setEnabled(False)
+        self.start_runtime = time.time()
+        try:
+            self.thread = VideoCutterThread(file_path, start_time, end_time, output_path, audio_level)
+            self.thread.progress.connect(self.progress_bar.setValue)
+            self.thread.finished.connect(self.on_extraction_complete)
+            self.thread.start()
+        except Exception as e:
+            print(e)
 
-        self.thread = VideoCutterThread(file_path, start_time, end_time, output_path, audio_level)
-        self.thread.progress.connect(self.progress_bar.setValue)
-        self.thread.finished.connect(self.on_extraction_complete)
-        self.thread.start()
+    def cancel_extract(self):
+        """Cancels the FFmpeg process."""
+        if self.thread:
+            self.thread.cancel()  # Cancel the thread's process
+        self.btn_cancel.setEnabled(False)  # Disable the cancel button
+        self.progress_bar.setValue(0)
+        self.btn_extract.setEnabled(True)
 
     def on_extraction_complete(self, output_file):
-        QMessageBox.information(self, "Success", f"Clip saved as:\n{output_file}")
+        self.btn_extract.setEnabled(True)
+        elapsed_time = time.time() - self.start_runtime
+        hours = int(elapsed_time // 3600)
+        minutes = int((elapsed_time % 3600) // 60)
+        seconds = int(elapsed_time % 60)
+
+        # Format elapsed time as hh:mm:ss
+        elapsed_time_str = f"{hours:02}:{minutes:02}:{seconds:02}"
+
+        QMessageBox.information(
+            self,
+            "Success",
+            f"Clip saved as:\n{output_file}\nElapsed Time: {elapsed_time_str}")
         self.progress_bar.setValue(100)
 
 
