@@ -12,9 +12,9 @@ import ffmpeg
 import numpy as np
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QGridLayout, QPushButton, QFileDialog,
-    QLabel, QLineEdit, QMessageBox, QProgressBar, QComboBox
+    QLabel, QLineEdit, QMessageBox, QProgressBar, QComboBox, QTimeEdit
 )
-from PyQt6.QtCore import QThread, pyqtSignal, Qt
+from PyQt6.QtCore import QThread, pyqtSignal, Qt, QTimer
 import requests
 from py7zip import py7zip
 
@@ -132,11 +132,6 @@ class VideoCutterThread(QThread):
         self._is_cancelled = False
 
     def run(self):
-        output_file = os.path.join(
-            self.output_path,
-            f"clip_{self.start_time.replace(':', '-')}"
-            f"_{self.end_time.replace(':', '-')}.mp4"
-        )
 
         command = [
             f"{FFMPEG_DIR}/ffmpeg.exe",
@@ -148,13 +143,26 @@ class VideoCutterThread(QThread):
             "-c:a", "aac",
         ]
 
+        file_level = 'skip'
         if not self.audio_level == 'Skip':
             command.extend(["-af", f"loudnorm=I={self.audio_level}"])
+            file_level = f'{self.audio_level}db'
 
+        output_file = os.path.join(
+            self.output_path,
+            f"clip_{self.start_time.replace(':', '-')}"
+            f"_{self.end_time.replace(':', '-')}"
+            f"_{file_level}.mp4"
+        )
         command.append(output_file)
-        print(' '.join(command))
-        self.process = subprocess.Popen(command, stdout=subprocess.PIPE,
-                                   stderr=subprocess.STDOUT, text=True)
+        # print(' '.join(command))
+        self.process = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
 
         for line in self.process.stdout:
             if self._is_cancelled:
@@ -237,6 +245,10 @@ class VideoCutterApp(QWidget):
         self.audio_level_value = QLabel('--')
         layout.addWidget(self.audio_level_value, 4, 1)
 
+        self.btn_audio_level = QPushButton("Get Current Level")
+        self.btn_audio_level.clicked.connect(self.analyze_audio_level)
+        layout.addWidget(self.btn_audio_level, 4, 2)
+
         # Start time input
         self.label_start = QLabel("Start Time (hh:mm:ss):")
         layout.addWidget(self.label_start, 5, 0)
@@ -295,6 +307,7 @@ class VideoCutterApp(QWidget):
         self.setLayout(layout)
 
     def select_file(self):
+        self.progress_bar.setValue(0)
         """Opens a file dialog for selecting a video file."""
         file_path, _ = QFileDialog.getOpenFileName(
             self, "Select Video File", "", f"Video Files (*{' *'.join(SUPPORTED_VIDEOS)})"
@@ -302,19 +315,20 @@ class VideoCutterApp(QWidget):
         if file_path:
             self.input_file.setText(file_path)
             self.update_video_duration(file_path)
-            self.analyze_audio_level(file_path)
+            self.audio_level_value.setText('--')
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
 
     def dropEvent(self, event):
+        self.progress_bar.setValue(0)
         try:
             file_url = event.mimeData().urls()[0].toLocalFile()
             if file_url and file_url.lower().endswith(SUPPORTED_VIDEOS):
                 self.input_file.setText(file_url)
                 self.update_video_duration(file_url)
-                self.analyze_audio_level(file_url)
+                self.audio_level_value.setText('--')
                 print(f'File Dropped: {file_url}')
             else:
                 QMessageBox.critical(self, 'Invalid File', f'Only ({SUPPORTED_VIDEOS}) are accepted')
@@ -325,8 +339,21 @@ class VideoCutterApp(QWidget):
         """Retrieves and displays the video duration."""
         try:
             # Run ffprobe to get video metadata in JSON format
-            cmd = [f'{FFMPEG_DIR}/ffprobe.exe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'json', file_path]
-            result = subprocess.run(cmd, stderr=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+            cmd = [
+                f'{FFMPEG_DIR}/ffprobe.exe',
+                '-v', 'error',
+                '-show_entries',
+                'format=duration',
+                '-of', 'json',
+                file_path
+            ]
+            result = subprocess.run(
+                cmd,
+                stderr=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
 
             # Parse the JSON output from ffprobe
             probe_output = json.loads(result.stdout)
@@ -342,22 +369,46 @@ class VideoCutterApp(QWidget):
             self.label_duration.setText("Duration: Error reading")
             print(f"Error: {e}")
 
-    def analyze_audio_level(self, file_path):
+    def analyze_audio_level(self):
         """Analyzes the current audio dB level of the video."""
+        file_path = self.input_file.text()
+        self.audio_level_value.setText("Analyzing audio level")
+        dots = 0
+
+        def update_dots():
+            nonlocal dots
+            # Update the text with "..."
+            dots = (dots + 1) % 4  # Will loop through 0, 1, 2, 3 dots
+            self.audio_level_value.setText(f"Analyzing audio level{'.' * dots}")
+
+        # Create a QTimer to update the dots every 500 milliseconds
+        timer = QTimer(self)
+        timer.timeout.connect(update_dots)
+        timer.start(500)  # Every 500 milliseconds
+
         try:
+            cmd = [
+                f"{FFMPEG_DIR}/ffmpeg.exe",
+                "-i", file_path,
+                "-af", "volumedetect",
+                "-f", "null", "-"
+            ]
             result = subprocess.run(
-                [f"{FFMPEG_DIR}/ffmpeg.exe", "-i", file_path, "-af", "volumedetect", "-f", "null", "-"],
+                cmd,
                 stderr=subprocess.PIPE,
-                text=True
+                text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW
             )
+        except Exception:
+            self.audio_level_value.setText("Current Audio Level: Error")
+        finally:
+            timer.stop()
             for line in result.stderr.split("\n"):
                 if "mean_volume" in line:
                     dB_level = line.split(":")[-1].strip()
-                    self.audio_level_value.setText(f"{dB_level} dB")
+                    self.audio_level_value.setText(f"{dB_level}")
                     return
             self.audio_level_value.setText("Current Audio Level: Not detected")
-        except Exception:
-            self.audio_level_value.setText("Current Audio Level: Error")
 
     def preview_clip(self):
         """Previews the selected video clip."""
@@ -405,6 +456,7 @@ class VideoCutterApp(QWidget):
 
     def validate_inputs(self):
         valid = True
+        max_time = self.duration_value.text()
         file_path = self.input_file.text()
         start_time = self.input_start.text()
         end_time = self.input_end.text()
@@ -419,6 +471,20 @@ class VideoCutterApp(QWidget):
 
         if not re.match(r'^[0-9]+:[0-5][0-9]:[0-5][0-9]$', end_time):
             QMessageBox.critical(self, "Error", "Invalid End Time Format.")
+            valid = False
+
+        hh, mm, ss = map(int, start_time.split(":"))
+        start = hh * 3600 + mm * 60 + ss
+        hh, mm, ss = map(int, end_time.split(":"))
+        end = hh * 3600 + mm * 60 + ss
+        hh, mm, ss = map(int, max_time.split(":"))
+        max = hh * 3600 + mm * 60 + ss
+        if start >= end:
+            QMessageBox.critical(self, 'Error', 'The start time must be less than the end time')
+            valid = False
+
+        if end > max:
+            QMessageBox.critical(self, 'Error', 'The end time can not be longer than the detected duration of the video.')
             valid = False
 
         if not os.path.isdir(output_path):
