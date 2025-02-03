@@ -32,25 +32,32 @@ SUPPORTED_VIDEOS = ('.mp4', '.mkv', '.avi', '.mov', '.flv')
 class InstallRequirementsThread(QThread):
     progress = pyqtSignal(str)  # Signal to send progress updates
     install_complete = pyqtSignal()  # Signal when installation is complete
+    installed = pyqtSignal()
     error_occurred = pyqtSignal(str)  # Signal when an error occurs
 
     def __init__(self):
         super().__init__()
 
     def run(self):
+        installed = True
         try:
             # Check and install VLC if needed
             if not self.is_vlc_installed():
+                installed = False
                 self.progress.emit("Installing VLC...")
                 self.install_vlc()
 
             # Check and install FFmpeg if needed
             if not self.is_ffmpeg_installed():
+                installed = False
                 self.progress.emit("Installing FFmpeg...")
                 self.install_ffmpeg()
 
             # Emit completion signal
-            self.install_complete.emit()
+            if installed:
+                self.installed.emit()
+            else:
+                self.install_complete.emit()
         except Exception as e:
             # If something goes wrong, emit the error message
             self.error_occurred.emit(str(e))
@@ -356,6 +363,7 @@ class VideoCutterApp(QWidget):
         self.install_thread = InstallRequirementsThread()
         self.install_thread.progress.connect(self.show_install_progress)
         self.install_thread.install_complete.connect(self.on_install_complete)
+        self.install_thread.installed.connect(self.on_install_not_required)
         self.install_thread.error_occurred.connect(self.on_install_error)
 
         # Start the installation thread
@@ -368,15 +376,17 @@ class VideoCutterApp(QWidget):
     def on_install_complete(self):
         """Handles actions when installation completes."""
         self.show_message("Installation complete! FFmpeg and VLC are ready to use.")
-        # Proceed with the rest of the app initialization
-        # self.initialize_ui()
+
+    def on_install_not_required(self):
+        """Handles actions when installation completes."""
+        self.install_thread.exit()
 
     def on_install_error(self, error_message):
         """Handles installation errors."""
         self.show_message(f"Error: {error_message}", QMessageBox.Critical)
 
     def show_message(self, message):
-        """Show a message box with the specified message and icon."""
+        """Show a message box with the specified message"""
         if not self.msg:
             self.msg = QMessageBox(self)
         self.msg.setText(message)
