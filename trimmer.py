@@ -115,6 +115,48 @@ class Install_Requirements():
                 shutil.rmtree(entry.path)
 
 
+class AudioLevelAnalysisThread(QThread):
+    """Thread for analyzing the audio level without blocking the UI."""
+    update_audio_level = pyqtSignal(str)  # Signal to update the UI with the audio level
+    update_dots = pyqtSignal(str)  # Signal to update the dots on the UI
+
+    def __init__(self, file_path):
+        super().__init__()
+        self.file_path = file_path
+
+    def run(self):
+        """Run the FFmpeg command to analyze the audio level."""
+        cmd = [
+            f"{FFMPEG_DIR}/ffmpeg.exe",
+            "-i", self.file_path,
+            "-af", "volumedetect",
+            "-f", "null", "-"
+        ]
+        try:
+            process = subprocess.Popen(
+                cmd,
+                stderr=subprocess.PIPE,
+                text=True,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            # Loop to update the UI with dots as long as the process runs
+            while True:
+                line = process.stderr.readline()
+                if not line:
+                    break
+                if "mean_volume" in line:
+                    dB_level = line.split(":")[-1].strip()
+                    self.update_audio_level.emit(f"{dB_level}")
+                    return
+
+                # Update the dots periodically to indicate the process is running
+                self.update_dots.emit('.')
+
+            process.wait()
+        except Exception:
+            self.update_audio_level.emit("Current Audio Level: Error")
+
+
 class VideoCutterThread(QThread):
     """Runs FFmpeg in a separate thread to prevent UI freezing."""
     progress = pyqtSignal(int)  # Signal to update progress bar
@@ -185,16 +227,19 @@ class VideoCutterThread(QThread):
         try:
             hh, mm, ss = map(float, time_str.split(":"))
             current_seconds = hh * 3600 + mm * 60 + ss
-            start_seconds = sum(
+            input_start_seconds = sum(
                 int(x) * 60 ** i for i, x in enumerate(
                     reversed(self.start_time.split(":"))
                 )
             )
-            end_seconds = sum(
+            start_seconds = 0
+            input_end_seconds = sum(
                 int(x) * 60 ** i for i, x in enumerate(
                     reversed(self.end_time.split(":"))
                 )
             )
+            end_seconds = input_end_seconds - input_start_seconds
+
             return int(((current_seconds - start_seconds) /
                         (end_seconds - start_seconds)) * 100)
         except ValueError:
@@ -372,43 +417,27 @@ class VideoCutterApp(QWidget):
     def analyze_audio_level(self):
         """Analyzes the current audio dB level of the video."""
         file_path = self.input_file.text()
-        self.audio_level_value.setText("Analyzing audio level")
-        dots = 0
+        self.audio_level_value.setText("")
+        self.btn_audio_level.setEnabled(False)
 
-        def update_dots():
-            nonlocal dots
-            # Update the text with "..."
-            dots = (dots + 1) % 4  # Will loop through 0, 1, 2, 3 dots
-            self.audio_level_value.setText(f"Analyzing audio level{'.' * dots}")
+        # Start the thread for audio analysis
+        self.audio_thread = AudioLevelAnalysisThread(file_path)
+        self.audio_thread.update_audio_level.connect(self.update_audio_level_display)
+        self.audio_thread.update_dots.connect(self.update_dots)
+        self.audio_thread.start()
 
-        # Create a QTimer to update the dots every 500 milliseconds
-        timer = QTimer(self)
-        timer.timeout.connect(update_dots)
-        timer.start(500)  # Every 500 milliseconds
+    def update_audio_level_display(self, level):
+        """Update the audio level label."""
+        self.audio_level_value.setText(f"{level}")
+        self.btn_audio_level.setEnabled(True)
 
-        try:
-            cmd = [
-                f"{FFMPEG_DIR}/ffmpeg.exe",
-                "-i", file_path,
-                "-af", "volumedetect",
-                "-f", "null", "-"
-            ]
-            result = subprocess.run(
-                cmd,
-                stderr=subprocess.PIPE,
-                text=True,
-                creationflags=subprocess.CREATE_NO_WINDOW
-            )
-        except Exception:
-            self.audio_level_value.setText("Current Audio Level: Error")
-        finally:
-            timer.stop()
-            for line in result.stderr.split("\n"):
-                if "mean_volume" in line:
-                    dB_level = line.split(":")[-1].strip()
-                    self.audio_level_value.setText(f"{dB_level}")
-                    return
-            self.audio_level_value.setText("Current Audio Level: Not detected")
+    def update_dots(self, dots):
+        """Update the dots on the UI during the process."""
+        current_text = self.audio_level_value.text()
+        if current_text == "......":
+            self.audio_level_value.setText("")
+        else:
+            self.audio_level_value.setText(current_text + dots)
 
     def preview_clip(self):
         """Previews the selected video clip."""
@@ -525,6 +554,7 @@ class VideoCutterApp(QWidget):
 
     def on_extraction_complete(self, output_file):
         self.btn_extract.setEnabled(True)
+        self.btn_cancel.setEnabled(False)
         elapsed_time = time.time() - self.start_runtime
         hours = int(elapsed_time // 3600)
         minutes = int((elapsed_time % 3600) // 60)
