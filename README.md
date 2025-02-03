@@ -10,7 +10,7 @@
 ### Supported Features:
 
 - Audio dB level analysis to display the current volume level.
-- Audio normalization options (-1 dB, -3 dB, -5 dB, or skip).
+- Audio normalization options (-5 dB, -10 dB, -15 dB, or skip).
 - Automatic video duration display.
 - Preview feature before extraction.
 - Drag-and-drop support.
